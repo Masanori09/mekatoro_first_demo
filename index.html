@@ -25,12 +25,13 @@ label{font-size:.82rem;display:flex;gap:6px;align-items:center}
 .bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:8px}
 .bar i{display:block;height:100%;width:0;background:var(--acc)}
 #msg{font-size:.85rem;margin-top:6px;min-height:1.3em}
+.legend{font-size:.78rem;opacity:.8;margin-top:6px}
 </style>
 </head>
 <body>
 <main>
 <h1>自動除雪機 デモ走行</h1>
-<p class="sub">幅72cm・高さ52cmのブレードで、設定した除雪範囲を往復走行(ボストロフェドン方式)し、雪が満杯になると雪置き場へ捨てに行きます。マップはドラッグで編集できます。</p>
+<p class="sub">幅72cm・高さ52cmのブレードで、設定した除雪範囲を往復走行(ボストロフェドン方式)し、雪が満杯になると雪置き場へ捨てに行きます。雪置き場への往復は障害物を避けて走行し、雪を積んだまま除雪範囲を通るとその部分の雪が増えるため、その分も再除雪します。マップはドラッグで編集できます。</p>
 
 <div class="card">
 <div class="row" id="tools">
@@ -46,6 +47,7 @@ label{font-size:.82rem;display:flex;gap:6px;align-items:center}
 <canvas id="cv" width="600" height="396"></canvas>
 <div class="bar"><i id="pg"></i></div>
 <div id="msg"></div>
+<div class="legend"><span class="sw" style="background:#e8700a"></span>雪を積んで雪置き場へ向かう経路 / <span class="sw" style="background:#2a8f4a"></span>空荷での移動経路 / 青の破線:除雪レーン</div>
 </div>
 
 <div class="card">
@@ -55,6 +57,7 @@ label{font-size:.82rem;display:flex;gap:6px;align-items:center}
 <button id="smp">サンプルマップ</button>
 <button id="clr">マップ全消去</button>
 <label>速度 <input type="range" id="spd" min="1" max="30" value="8"><span id="spdv">8x</span></label>
+<label><input type="checkbox" id="aware" checked>雪の加算を考慮して経路を選ぶ</label>
 </div>
 <div class="stats">
 <div>経過時間<b id="s_t">0:00</b></div>
@@ -62,6 +65,8 @@ label{font-size:.82rem;display:flex;gap:6px;align-items:center}
 <div>積載量<b id="s_l">0.00 m³</b></div>
 <div>運搬回数<b id="s_n">0</b></div>
 <div>走行距離<b id="s_d">0 m</b></div>
+<div>運搬中に加算された雪<b id="s_a">0.000 m³</b></div>
+<div>再除雪レーン計画<b id="s_r">0 回</b></div>
 </div>
 </div>
 </main>
@@ -70,13 +75,19 @@ label{font-size:.82rem;display:flex;gap:6px;align-items:center}
 "use strict";
 const W=100,H=66,CS=0.12,PX=6;           // 100x66セル、1セル=12cm(画面6px)
 const BW=0.72, BH=0.52, CAP=0.35, V0=0.5; // ブレード幅/高さ[m]、積載容量[m³]、基準速度[m/s]
+const CLR=3.0;      // 障害物から確保する最小距離[セル](=36cm、ブレード半幅)
+const SOFT=5;       // 障害物から離れて走るための緩やかな回避範囲[セル]
+const PEN=4;        // 雪を積んだまま除雪範囲を通るときの経路コスト倍率(満載時に+400%)
+const SPILL=0.04;   // 満載で除雪範囲を1m走ったときに加算される雪[m³/m]
+const MAXRE=10;     // 再除雪レーンの再計画回数の上限
 const T=new Uint8Array(W*H);              // 0:なし 1:除雪範囲 2:雪置き場 3:障害物
 const snow=new Float32Array(W*H);         // 積雪深[m]
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-let tool=1,R,running=false,last=0,total0=0,zone0=1,B=null;
+let tool=1,R,running=false,last=0,total0=0,zone0=1,B=null;  // B:障害物までの距離マップ[セル]
 const $=id=>document.getElementById(id);
 const idx=(c,r)=>r*W+c, inb=(c,r)=>c>=0&&r>=0&&c<W&&r<H;
 const rnd=()=>0.14+Math.random()*0.26;     // 初期積雪 14〜40cm(ブレード高さ52cm以内)
+const cellOf=p=>idx(Math.min(W-1,Math.max(0,Math.floor(p.x/CS))),Math.min(H-1,Math.max(0,Math.floor(p.y/CS))));
 
 function rect(c0,r0,w,h,v){for(let r=r0;r<r0+h;r++)for(let c=c0;c<c0+w;c++)if(inb(c,r))set(c,r,v)}
 function set(c,r,v){const i=idx(c,r);T[i]=v;snow[i]=(v===1)?rnd():0}
@@ -84,73 +95,131 @@ function sample(){T.fill(0);snow.fill(0);
  rect(10,20,66,22,1);rect(10,6,16,14,1);
  rect(82,40,15,22,2);
  rect(50,26,12,9,3);rect(30,32,3,3,3);
- reset()}
+ B=null;reset()}
 function reset(){
  for(let i=0;i<T.length;i++)snow[i]=(T[i]===1)?(snow[i]>0?snow[i]:rnd()):0;
- // 雪置き場に残った雪を初期化
- R={x:1,y:1,th:0,load:0,queue:[],segs:[],plan:[],cur:null,resume:null,needDump:false,phase:'work',home:false,done:false,t:0,dist:0,trips:0,started:false};
+ R={x:1,y:1,th:0,load:0,queue:[],segs:[],plan:[],cur:null,resume:null,needDump:false,phase:'work',home:false,done:false,err:false,t:0,dist:0,trips:0,started:false,spill:0,replans:0};
  running=false;$('run').textContent='▶ 走行開始';
  total0=0;zone0=0;for(let i=0;i<T.length;i++)if(T[i]===1){total0+=snow[i];zone0++}
  msg('');stats();draw()}
 function msg(s){$('msg').textContent=s}
 
 // ---- 経路計画 ----
-function inflate(){B=new Uint8Array(W*H);const R2=4;
+// 障害物までの距離[セル]を全セルについて求める(円形の余裕を確保するため)
+function inflate(){B=new Float32Array(W*H).fill(99);const K=6;
  for(let r=0;r<H;r++)for(let c=0;c<W;c++)if(T[idx(c,r)]===3)
-  for(let dr=-R2;dr<=R2;dr++)for(let dc=-R2;dc<=R2;dc++)if(inb(c+dc,r+dr))B[idx(c+dc,r+dr)]=1}
-function plan(){
+  for(let dr=-K;dr<=K;dr++)for(let dc=-K;dc<=K;dc++){const cc=c+dc,rr=r+dr;
+   if(!inb(cc,rr))continue;const d=Math.hypot(dc,dr),j=idx(cc,rr);if(d<B[j])B[j]=d}}
+const needCell=i=>T[i]===1&&snow[i]>0.004;       // まだ除雪が必要なセル
+function needLeft(){for(let i=0;i<T.length;i++)if(needCell(i))return true;return false}
+// レーン計画。off はレーン位置の上方向ずらし量[m]。cover は刈れるセル数(再除雪時にずらし量を選ぶ指標)
+function planAt(off,only){
  let r0=H,r1=-1;
- for(let r=0;r<H;r++)for(let c=0;c<W;c++)if(T[idx(c,r)]===1){r0=Math.min(r0,r);r1=Math.max(r1,r)}
- if(r1<0)return [];
+ for(let r=0;r<H;r++)for(let c=0;c<W;c++)if(needCell(idx(c,r))){r0=Math.min(r0,r);r1=Math.max(r1,r)}
+ if(r1<0)return {lanes:[],cover:0};
  const y0=r0*CS,y1=(r1+1)*CS,lanes=[],step=BW-0.06,hw=BW/2;
- let yc=y0+hw,li=0;
+ let yc=Math.max(hw,y0+hw-off),li=0,cover=0;
  while(true){
   const y=Math.min(yc,Math.max(y0+hw,y1-hw));
   const ra=Math.max(0,Math.floor((y-hw)/CS)),rb=Math.min(H-1,Math.floor((y+hw-1e-6)/CS));
-  const segs=[];let s=-1;
+  const segs=[];let s=-1,cnt=0;
   for(let c=0;c<=W;c++){
-   let ok=false;
-   if(c<W){let z=false,bad=false;
-    for(let r=ra;r<=rb;r++){const t=T[idx(c,r)];if(t===3||t===2)bad=true;if(t===1)z=true}
-    ok=z&&!bad}
-   if(ok&&s<0)s=c;
-   if(!ok&&s>=0){if(c-s>=3)segs.push({sx:s*CS+CS/2,ex:c*CS-CS/2,y});s=-1}
+   let ok=false,zc=0;
+   if(c<W){let bad=false;
+    for(let r=ra;r<=rb;r++){const i=idx(c,r),t=T[i];if(t===3||t===2)bad=true;if(needCell(i))zc++}
+    ok=zc>0&&!bad}
+   if(ok){if(s<0){s=c;cnt=0}cnt+=zc}
+   if(!ok&&s>=0){if(c-s>=3){segs.push({sx:s*CS+CS/2,ex:c*CS-CS/2,y,ra,rb});cover+=cnt}s=-1}
   }
   if(li%2===1)segs.reverse().forEach(g=>{const a=g.sx;g.sx=g.ex;g.ex=a});
-  segs.forEach(g=>lanes.push(g));
+  // ブレードはロボット中心の約0.4m前方にあるため、走行位置をその分だけ後ろにずらしてレーン端まで刈れるようにする
+  segs.forEach(g=>{const d=g.ex>=g.sx?1:-1;let k=0;
+   while(k<8){const c=Math.floor((g.sx-d*(k+1)*CS)/CS);if(c<0||c>=W)break;let bad=false;
+    for(let r=g.ra;r<=g.rb;r++){const t=T[idx(c,r)];if(t===3||t===2){bad=true;break}}
+    if(bad)break;k++}
+   const sx=g.sx-d*Math.min(0.4,Math.max(0,k-4)*CS);   // 機体後部(約0.45m)が障害物に入らないよう余裕を残す
+   let ex=g.ex-d*0.4;if((ex-sx)*d<0)ex=sx;
+   lanes.push({sx,ex,y:g.y})});
   li++;if(y>=y1-hw-0.01||y>=Math.max(y0+hw,y1-hw)-1e-6&&yc>=y1-hw)break;
   yc+=step;
  }
- return lanes}
-function bfs(a,b){
+ return {lanes,cover}}
+function plan(replan){
+ if(!replan)return planAt(0).lanes;
+ // 再除雪:レーン位置を数通りずらして、最も多く刈れる配置を選ぶ
+ let best=null;
+ for(let k=0;k<6;k++){const r=planAt(k*(BW-0.06)/6);if(!best||r.cover>best.cover)best=r}
+ return best.cover>=3?best.lanes:[]}
+
+// 最小ヒープ(ダイクストラ法用)
+function Heap(){const a=[];return{
+ n:()=>a.length,
+ push(d,i){a.push([d,i]);let k=a.length-1;while(k>0){const p=(k-1)>>1;if(a[p][0]<=a[k][0])break;[a[p],a[k]]=[a[k],a[p]];k=p}},
+ pop(){const t=a[0],l=a.pop();if(a.length){a[0]=l;let k=0;for(;;){let m=k;const x=2*k+1,y=x+1;
+  if(x<a.length&&a[x][0]<a[m][0])m=x;if(y<a.length&&a[y][0]<a[m][0])m=y;if(m===k)break;[a[m],a[k]]=[a[k],a[m]];k=m}}return t}}}
+
+// ダイクストラ法。障害物は通らず、雪を積んでいるときは「除雪範囲を通る=雪が加算される」分をコストに上乗せする
+function dijkstra(a,loaded,b){
  if(!B)inflate();
- const sc=Math.min(W-1,Math.max(0,Math.floor(a.x/CS))),sr=Math.min(H-1,Math.max(0,Math.floor(a.y/CS)));
- const gc=Math.min(W-1,Math.max(0,Math.floor(b.x/CS))),gr=Math.min(H-1,Math.max(0,Math.floor(b.y/CS)));
- const prev=new Int32Array(W*H).fill(-2),q=[idx(sc,sr)];prev[q[0]]=-1;const goal=idx(gc,gr);
- for(let h=0;h<q.length&&prev[goal]===-2;h++){const i=q[h],c=i%W,r=(i/W)|0;
+ const si=cellOf(a),gi=b?cellOf(b):-1;
+ // 安全距離CLR未満でも通れるのは、出発点・目的地の近く(5セル以内)だけ。そこから抜け出す/入るために必要
+ const sc=si%W,sr=(si/W)|0,gc=gi>=0?gi%W:0,gr=gi>=0?(gi/W)|0:0;
+ const tolS=Math.max(1,Math.min(CLR,B[si])),tolG=gi>=0?Math.max(1,Math.min(CLR,B[gi])):CLR;
+ const okc=(c,r)=>{const b=B[idx(c,r)];if(b>=CLR)return true;
+  if(b>=tolS&&Math.hypot(c-sc,r-sr)<=5)return true;
+  return gi>=0&&b>=tolG&&Math.hypot(c-gc,r-gr)<=5};
+ const aware=$('aware').checked,lf=Math.max(0,Math.min(1,R.load/CAP));
+ const dist=new Float64Array(W*H).fill(Infinity),prev=new Int32Array(W*H).fill(-1),hp=Heap();
+ dist[si]=0;hp.push(0,si);
+ while(hp.n()){
+  const [d,i]=hp.pop();if(d>dist[i])continue;if(i===gi)break;
+  const c=i%W,r=(i/W)|0;
   for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){if(!dc&&!dr)continue;
    const nc=c+dc,nr=r+dr;if(!inb(nc,nr))continue;const j=idx(nc,nr);
-   if(prev[j]!==-2||(B[j]&&j!==goal))continue;prev[j]=i;q.push(j)}}
- if(prev[goal]===-2)return [{x:b.x,y:b.y,mode:'travel'}];
- const p=[];for(let i=goal;i>=0;i=prev[i])p.push(i);p.reverse();
- const out=[];p.forEach((i,k)=>{if(k%3===0||k===p.length-1)out.push({x:(i%W)*CS+CS/2,y:((i/W)|0)*CS+CS/2,mode:'travel'})});
- out.push({x:b.x,y:b.y,mode:'travel'});return out}
-function bestDump(){let best=null,bs=1e9;
- for(let i=0;i<T.length;i++)if(T[i]===2){const x=(i%W)*CS+CS/2,y=((i/W)|0)*CS+CS/2;
-  const s=Math.hypot(x-R.x,y-R.y)+snow[i]*6;if(s<bs){bs=s;best={x,y}}}
+   if(!okc(nc,nr))continue;
+   if(dc&&dr&&(!okc(c+dc,r)||!okc(c,r+dr)))continue;                  // 斜め移動で角を切らない
+   const w=((dc&&dr)?1.4142:1)*CS;let cost=w;
+   if(B[j]<SOFT)cost+=w*(SOFT-B[j])*0.5;                              // なるべく障害物から離れる
+   if(loaded&&aware&&T[j]===1)cost+=w*PEN*lf;                          // 雪を積んだまま除雪範囲を通ると雪が増える
+   const nd=d+cost;if(nd<dist[j]){dist[j]=nd;prev[j]=i;hp.push(nd,j)}}}
+ return {dist,prev}}
+// a→b の経路をウェイポイント列にする。到達できなければ null
+function route(a,b,mode){
+ const gi=cellOf(b),res=dijkstra(a,mode==='carry',b);
+ if(!isFinite(res.dist[gi]))return null;
+ const p=[];for(let i=gi;i>=0;i=res.prev[i])p.push(i);p.reverse();
+ const out=[];
+ for(let k=1;k<p.length;k++){
+  const i=p[k],c=i%W,r=(i/W)|0;
+  if(k<p.length-1){const n=p[k+1],pc=p[k-1];
+   if((c-(pc%W))===((n%W)-c)&&(r-((pc/W)|0))===(((n/W)|0)-r))continue}  // 直線上の点は省略
+  out.push({x:c*CS+CS/2,y:r*CS+CS/2,mode})}
+ out.push({x:b.x,y:b.y,mode});return out}
+// 雪置き場は「障害物を避け、雪の加算も考慮した実際の移動コスト」が最小のセルを選ぶ
+function bestDump(){const res=dijkstra(R,true,null);let best=null,bs=Infinity;
+ for(let i=0;i<T.length;i++)if(T[i]===2&&isFinite(res.dist[i])){
+  const s=res.dist[i]+snow[i]*6;if(s<bs){bs=s;best={x:(i%W)*CS+CS/2,y:((i/W)|0)*CS+CS/2}}}
  return best}
 
 // ---- 動作 ----
 function decide(){
  if(R.phase==='dumping'){R.phase='work';
-  if(R.resume){const p=R.resume;R.resume=null;
-   R.queue=bfs(R,p).concat([{x:R.cur.ex,y:R.cur.y,mode:'work',end:true}]);return}}
+  if(R.resume){const p=R.resume;R.resume=null;const rt=route(R,p,'move');      // 空荷で障害物を避けて戻る
+   if(rt&&R.cur){R.queue=rt.concat([{x:R.cur.ex,y:R.cur.y,mode:'work',end:true}]);return}
+   R.cur=null}}
  if(R.needDump){R.needDump=false;const d=bestDump();
-  R.queue=bfs(R,d).concat([{x:d.x,y:d.y,mode:'dump'}]);R.phase='dumping';return}
+  const rt=d?route(R,d,'carry'):null;
+  if(!rt){R.done=true;R.err=true;msg('雪置き場へ到達できないため停止しました(障害物で塞がれています)。');return}
+  R.queue=rt.concat([{x:d.x,y:d.y,mode:'dump'}]);R.phase='dumping';return}
  if(R.segs.length){R.cur=R.segs.shift();
-  R.queue=bfs(R,{x:R.cur.sx,y:R.cur.y}).concat([{x:R.cur.ex,y:R.cur.y,mode:'work',end:true}]);return}
+  const rt=route(R,{x:R.cur.sx,y:R.cur.y},'move');
+  if(!rt){R.cur=null;return decide()}
+  R.queue=rt.concat([{x:R.cur.ex,y:R.cur.y,mode:'work',end:true}]);return}
+ // 運搬中に加算された雪が残っていれば、残ったセルだけレーンを引き直して再除雪
+ if(R.replans<MAXRE&&needLeft()){R.replans++;const s=plan(true);
+  if(s.length){R.segs=s;R.plan=s.map(g=>({...g}));return decide()}}
  if(R.load>0.001){R.needDump=true;R.resume=null;return decide()}
- if(!R.home){R.home=true;R.queue=bfs(R,{x:1,y:1});return}
+ if(!R.home){R.home=true;const rt=route(R,{x:1,y:1},'move');R.queue=rt||[];return}
  R.done=true}
 function pickup(){
  const nx=-Math.sin(R.th),ny=Math.cos(R.th),fx=Math.cos(R.th)*0.4,fy=Math.sin(R.th)*0.4;
@@ -158,6 +227,16 @@ function pickup(){
   const c=Math.floor((R.x+fx+nx*t)/CS),r=Math.floor((R.y+fy+ny*t)/CS);
   if(!inb(c,r))continue;const i=idx(c,r);
   if(T[i]===1&&snow[i]>0&&snow[i]<=BH){R.load+=snow[i]*CS*CS;snow[i]=0}}}
+// 雪を積んだまま除雪範囲を通ると、ブレード幅の範囲の雪が増える(積載量が多いほど多い)
+function spill(dm){
+ const nx=-Math.sin(R.th),ny=Math.cos(R.th),cells=new Set();let n=0;
+ for(let t=-BW/2;t<=BW/2+1e-9;t+=CS/2){n++;
+  const c=Math.floor((R.x+nx*t)/CS),r=Math.floor((R.y+ny*t)/CS);
+  if(inb(c,r)&&T[idx(c,r)]===1)cells.add(idx(c,r))}
+ if(!cells.size)return;
+ const vol=Math.min(R.load,SPILL*(R.load/CAP)*dm*cells.size/n);
+ const per=vol/cells.size/(CS*CS);
+ cells.forEach(i=>snow[i]+=per);R.load-=vol;R.spill+=vol}
 function unload(dt){
  const amt=Math.min(R.load,0.12*dt);const cells=[];
  const rc=Math.round(0.6/CS);const c0=Math.floor(R.x/CS),r0=Math.floor(R.y/CS);
@@ -168,10 +247,11 @@ function adv(dm,dt){
  if(!R.queue.length){decide();if(!R.queue.length)return}
  const w=R.queue[0];
  if(w.mode==='dump'){unload(dt);if(R.load<=1e-5){R.load=0;R.trips++;R.queue.shift()}return}
- const dx=w.x-R.x,dy=w.y-R.y,d=Math.hypot(dx,dy);
+ const dx=w.x-R.x,dy=w.y-R.y,d=Math.hypot(dx,dy);let mv=0;
  if(d>0.02){const a=Math.atan2(dy,dx);let da=a-R.th;while(da>Math.PI)da-=2*Math.PI;while(da<-Math.PI)da+=2*Math.PI;R.th+=da*0.35}
- if(d<=dm){R.x=w.x;R.y=w.y;R.dist+=d;R.queue.shift();if(w.end)R.cur=null}
- else{R.x+=dx/d*dm;R.y+=dy/d*dm;R.dist+=dm}
+ if(d<=dm){R.x=w.x;R.y=w.y;mv=d;R.dist+=d;R.queue.shift();if(w.end)R.cur=null}
+ else{R.x+=dx/d*dm;R.y+=dy/d*dm;mv=dm;R.dist+=dm}
+ if(w.mode==='carry'&&R.load>1e-6)spill(mv);
  if(w.mode==='work'){pickup();
   if(R.load>=CAP&&R.cur){R.resume={x:R.x,y:R.y};R.needDump=true;R.queue=[]}}}
 
@@ -179,7 +259,8 @@ function tick(ts){
  if(running&&!R.done){const dt=Math.min(0.05,(ts-last)/1000)*$('spd').value;
   const n=Math.max(1,Math.ceil(V0*dt/0.04));
   for(let k=0;k<n;k++){adv(V0*dt/n,dt/n);R.t+=dt/n;if(R.done)break}
-  if(R.done){running=false;$('run').textContent='▶ 走行開始';msg('除雪が完了しました。')}
+  if(R.done){running=false;$('run').textContent='▶ 走行開始';stats();
+   if(!R.err)msg('走行を終了しました。除雪進捗 '+$('s_p').textContent+'(運搬中に加算された雪 '+R.spill.toFixed(3)+' m³、再除雪の計画 '+R.replans+' 回)')}
   stats()}
  last=ts;draw();requestAnimationFrame(tick)}
 
@@ -204,6 +285,11 @@ function draw(){
  const m=PX/CS;
  if(R.plan.length){ctx.strokeStyle='rgba(30,110,200,.55)';ctx.setLineDash([4,3]);ctx.lineWidth=1;
   R.plan.forEach(s=>{ctx.beginPath();ctx.moveTo(s.sx*m,s.y*m);ctx.lineTo(s.ex*m,s.y*m);ctx.stroke()});ctx.setLineDash([])}
+ // 現在向かっている経路(橙:雪を積んで運搬、緑:空荷の移動)
+ if(R.queue.length){let px=R.x,py=R.y;ctx.lineWidth=2;ctx.setLineDash([]);
+  for(const w of R.queue){if(w.mode==='dump'||w.mode==='work')break;
+   ctx.strokeStyle=w.mode==='carry'?'rgba(232,112,10,.9)':'rgba(42,143,74,.9)';
+   ctx.beginPath();ctx.moveTo(px*m,py*m);ctx.lineTo(w.x*m,w.y*m);ctx.stroke();px=w.x;py=w.y}}
  // ホーム
  ctx.fillStyle='#2a8f4a';ctx.font='11px sans-serif';ctx.fillText('H',1*m-3,1*m-14);
  // ロボット
@@ -221,7 +307,8 @@ function stats(){
  const p=zone0?Math.round((1-rem/zone0)*100):0;
  $('s_p').textContent=p+'%';$('pg').style.width=p+'%';
  const t=Math.floor(R.t);$('s_t').textContent=Math.floor(t/60)+':'+String(t%60).padStart(2,'0');
- $('s_l').textContent=R.load.toFixed(2)+' m³';$('s_n').textContent=R.trips;$('s_d').textContent=R.dist.toFixed(0)+' m'}
+ $('s_l').textContent=R.load.toFixed(2)+' m³';$('s_n').textContent=R.trips;$('s_d').textContent=R.dist.toFixed(0)+' m';
+ $('s_a').textContent=R.spill.toFixed(3)+' m³';$('s_r').textContent=R.replans+' 回'}
 
 // ---- マップ編集 ----
 let drawing=false;
@@ -240,7 +327,7 @@ document.querySelectorAll('#tools button').forEach(b=>b.onclick=()=>{
 $('run').onclick=start;
 $('rst').onclick=()=>{for(let i=0;i<T.length;i++)if(T[i]===1)snow[i]=rnd();else if(T[i]===2)snow[i]=0;B=null;reset()};
 $('smp').onclick=sample;
-$('clr').onclick=()=>{T.fill(0);snow.fill(0);reset()};
+$('clr').onclick=()=>{T.fill(0);snow.fill(0);B=null;reset()};
 $('spd').oninput=()=>{$('spdv').textContent=$('spd').value+'x'};
 sample();requestAnimationFrame(tick);
 })();
